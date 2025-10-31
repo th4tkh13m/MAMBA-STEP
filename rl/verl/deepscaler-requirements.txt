@@ -1,0 +1,4 @@
+google-cloud-aiplatform
+latex2sympy2
+sentence_transformers
+tabulate
