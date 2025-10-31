@@ -72,7 +72,7 @@ class MHADecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
+# Khiem: Fix tuple value, see https://github.com/jxiw/M1/issues/7
 #        if inference_params is None:
 #            return (hidden_states, None, None)
 #        else:
@@ -113,7 +113,7 @@ class MambaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
+# Khiem: Fix tuple value, see https://github.com/jxiw/M1/issues/7
 #        if inference_params is None:
 #            return (hidden_states, None, None)
 #        else:
