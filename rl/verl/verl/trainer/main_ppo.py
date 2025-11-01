@@ -208,25 +208,25 @@ class TaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        # reward_manager_name = config.reward_model.get("reward_manager", "naive")
-        # if reward_manager_name == 'naive':
-        #     from verl.workers.reward_manager import NaiveRewardManager
-        #     reward_manager_cls = NaiveRewardManager
-        # elif reward_manager_name == 'prime':
-        #     from verl.workers.reward_manager import PrimeRewardManager
-        #     reward_manager_cls = PrimeRewardManager
-        # else:
-        #     raise NotImplementedError
+        # Khiem: Handle different reward manager types
+        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+        if reward_manager_name == 'naive':
+            from verl.workers.reward_manager import NaiveRewardManager
+            reward_manager_cls = NaiveRewardManager
+        elif reward_manager_name == 'prime':
+            from verl.workers.reward_manager import PrimeRewardManager
+            reward_manager_cls = PrimeRewardManager
+        elif reward_manager_name == 'blank':
+            from verl.workers.reward_manager import BlankRewardManager
+            reward_manager_cls = BlankRewardManager
+        else:
+            raise NotImplementedError
 
-        # compute_score = get_custom_reward_fn(config)
-        # reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
+        compute_score = get_custom_reward_fn(config)
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
-        # # Note that we always use function-based RM for validation
-        # val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
-
-        reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
-
-        val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+        # Note that we always use function-based RM for validation
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

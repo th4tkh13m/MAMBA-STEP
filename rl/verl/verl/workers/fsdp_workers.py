@@ -1190,3 +1190,374 @@ class RewardModelWorker(Worker):
 
         output = output.to('cpu')
         return output
+
+# Khiem: Add Process Reward Model Worker for PURE implementation
+class ProcessRewardModelWorker(Worker):
+    """
+    Process Reward Model (PRM) Worker for PURE implementation.
+    Computes token-level process rewards with min-form credit assignment.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        self.config = config
+
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
+
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                        mesh_dim_names=['dp', 'sp'])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        self.use_remove_padding = self.config.model.get('use_remove_padding', False)
+
+        # PURE-specific: credit assignment configuration
+        credit_assignment = self.config.get('credit_assignment', 0.1)
+        if credit_assignment in ['gamma-decay', 'strict min-form']:
+            self.disable_approx_min_form_credit_assignment = True
+        else:
+            self.disable_approx_min_form_credit_assignment = False
+            self.temperature = credit_assignment
+
+        # normalize config
+        if self.config.micro_batch_size is not None:
+            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
+
+    def _build_model(self, config):
+        from transformers import AutoModelForTokenClassification, AutoConfig
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, CPUOffload
+
+        # download the checkpoint from hdfs
+        local_path = copy_to_local(config.model.path)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get('trust_remote_code', False))
+
+        trust_remote_code = config.model.get('trust_remote_code', False)
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        model_config.num_labels = 2  # Binary classification for process rewards
+
+        use_remove_padding = config.model.get('use_remove_padding', False)
+        if use_remove_padding:
+            from verl.models.registry import check_model_support_rmpad
+            check_model_support_rmpad(model_config.model_type)
+
+        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(model_config, verbose=True)
+
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings,
+                                                       mesh=self.device_mesh)
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            setattr(model_config, 'classifier_dropout', 0.)
+            process_reward_module = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                config=model_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code
+            )
+            process_reward_module.to(torch.bfloat16)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(module=process_reward_module, config=self.config.model.fsdp_config)
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        process_reward_module = FSDP(
+            process_reward_module,
+            param_init_fn=init_fn,
+            use_orig_params=False,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy,
+            sync_module_states=True,
+            cpu_offload=CPUOffload(offload_params=True),
+            forward_prefetch=False,
+            device_mesh=self.device_mesh
+        )
+
+        return process_reward_module
+
+    def _init_separator(self, config):
+        """Initialize step separator tokens for splitting reasoning steps."""
+        # split response into steps based on what character
+        split_step_char = config.get('split_step_char', '\n\n')
+        self.split_step_tokens = []
+        # all tokens which end with "\n\n"
+        for i in range(len(self.tokenizer)):
+            decoded = self.tokenizer.decode(i)
+            if decoded.endswith(split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(
+            self.split_step_tokens,
+        ).to(device=torch.cuda.current_device())
+
+        # token for reward prediction
+        step_separator = config.get('step_separator', '\n')
+        self.step_separator_token = self.tokenizer.encode(
+            step_separator,
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).squeeze(0).to(device=torch.cuda.current_device())
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # This is used to import external_lib into the huggingface systems
+        import_external_libs(self.config.model.get('external_lib', None))
+        self.process_reward_module = self._build_model(config=self.config)
+        self._init_separator(self.config)
+
+    def _split_steps(self, data):
+        """
+        Split responses into reasoning steps by '\n\n' separator.
+        Returns score_ids, score_mask, reward_mask, and num_steps.
+        """
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        # Find all occurrences of step separator tokens
+        # This creates a mask where True indicates a separator token
+        mask = torch.isin(solution_tokens, self.split_step_tokens)
+        mask = mask * action_mask  # Only consider valid tokens
+
+        # Find indices of separator tokens
+        row_ids, column_ids = torch.where(mask)
+
+        # Find EOS token positions
+        position_ids = data.batch['position_ids'][:, problem_length:]
+        attention_mask = action_mask
+        eos_indices = torch.argmax(position_ids * attention_mask, dim=-1)
+
+        # Build score_ids and reward_mask
+        max_steps = mask.sum(dim=-1).max().item() + 1  # +1 for final step
+        score_ids = torch.full((bs, max_steps), -1, dtype=torch.long, device=solution_tokens.device)
+        reward_mask = torch.zeros((bs, num_actions), dtype=torch.bool, device=solution_tokens.device)
+
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids == j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            # intermediate steps
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            # last step
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+
+        score_mask = score_ids != -1
+        # score_ids, score_mask, reward_mask for data.batch['responses'],
+        # not for data.batch['input_ids']
+        output = dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        )
+        return DataProto.from_dict(tensors=output)
+
+    def _build_inputs_for_prm(self, data):
+        """
+        Build inputs for PRM forward pass.
+        Removes '\n\n' separators and adds '\n' for prediction.
+        """
+        from torch.nn.utils.rnn import pad_sequence
+        from torch.nn import functional as F
+
+        # fetch var
+        problem_ids = data.batch['prompts']
+        attention_mask = data.batch['attention_mask']
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        bs, problem_length = problem_ids.shape
+        total_length = data.batch['input_ids'].size(-1)
+        problem_attn_mask = attention_mask[:, :problem_length]
+        solution_attn_mask = attention_mask[:, problem_length:]
+        device = problem_ids.device
+
+        # build input_ids, attn_mask, and position_ids for PRM
+        # (optional) remove '\n\n' at the end of each step,
+        # then add '\n' for each step to predict process reward
+        input_ids = []
+        attn_mask = []
+        for i in range(bs):
+            input_ids_per_data = problem_ids[i]
+            attn_mask_per_data = problem_attn_mask[i]
+            # split tokens of each step
+            for idx, j in enumerate(score_ids[i][score_mask[i]]):
+                # j -> '\n\n'
+                if idx == 0:
+                    start_idx = 0
+                else:
+                    start_idx = score_ids[i, idx - 1] + 1
+                # slicer [..., :j] means drop the last '\n\n' of each step
+                step_tokens = solution_tokens[i, start_idx:j]
+                step_attn_mask = solution_attn_mask[i, start_idx:j]
+                # add '\n' after each step to predict process reward
+                input_ids_per_data = torch.cat(
+                    (input_ids_per_data, step_tokens, self.step_separator_token)
+                )
+                attn_mask_per_data = torch.cat(
+                    (attn_mask_per_data, step_attn_mask, torch.ones(
+                        1, device=device, dtype=attn_mask_per_data.dtype
+                    ))
+                )
+            input_ids.append(input_ids_per_data)
+            attn_mask.append(attn_mask_per_data)
+        # gather into batch
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        attn_mask = pad_sequence(attn_mask, batch_first=True, padding_value=0)
+        # pad to total_length at dim=1
+        input_ids = F.pad(input_ids, (0, total_length - input_ids.size(-1)), value=self.tokenizer.pad_token_id)
+        attn_mask = F.pad(attn_mask, (0, total_length - attn_mask.size(-1)), value=0)
+        position_ids = compute_position_id_with_mask(attn_mask)
+
+        # for forward of PRM
+        output = dict(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            position_ids=position_ids,
+        )
+        output = DataProto.from_dict(tensors=output)
+        return output
+
+    def _forward_micro_batch(self, micro_batch):
+        """Forward pass for a micro batch with approximate min-form credit assignment."""
+        from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis, rearrange
+        from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
+
+        response_length = micro_batch['responses'].size(-1)
+
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            batch, seqlen = input_ids.shape
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            reward_mask = micro_batch['reward_mask']
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                                      indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                output = self.process_reward_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+                reward_rmpad = output.logits
+                reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz, 2)
+
+                # gather output if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad,
+                                                           gather_dim=0,
+                                                           unpad_dim=0,
+                                                           padding_size=pad_size)
+
+                # pad it back
+                rm_score = pad_input(reward_rmpad, indices=indices, batch=batch, seqlen=seqlen)
+            else:
+                output = self.process_reward_module(input_ids=input_ids,
+                                                    attention_mask=attention_mask,
+                                                    position_ids=position_ids)
+                rm_score = output.logits  # (batch_size, seq_len, 2)
+
+        rm_score = rm_score[:, -response_length:]
+        rm_score = rm_score.softmax(dim=-1)
+        rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
+
+        # PURE: Approximate min-form credit assignment using softmax weighting
+        if not self.disable_approx_min_form_credit_assignment:
+            weight = torch.softmax(
+                -rm_score.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.temperature,
+                dim=-1,
+            )
+            rm_score *= weight
+
+        return rm_score
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        """Main entry point for computing process reward scores."""
+        import itertools
+        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+
+        data = data.to('cuda')
+
+        # Split responses into reasoning steps
+        data.union(self._split_steps(data))
+
+        # Build inputs for PRM
+        prm_data = self._build_inputs_for_prm(data)
+        prm_data = prm_data.to('cuda')
+        prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
+
+        with self.ulysses_sharding_manager:
+            prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
+
+            self.process_reward_module.eval()
+            batch = prm_data.batch
+
+            use_dynamic_bsz = self.config.use_dynamic_bsz
+            if use_dynamic_bsz:
+                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            else:
+                micro_batches = batch.split(self.config.micro_batch_size_per_gpu)
+
+            output = []
+            for micro_batch in micro_batches:
+                rm_score = self._forward_micro_batch(micro_batch)
+                output.append(rm_score)
+            token_level_scores = torch.cat(output, dim=0)
+
+            if use_dynamic_bsz:
+                indices = list(itertools.chain.from_iterable(indices))
+                assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
+                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                token_level_scores = token_level_scores[revert_indices]
+
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        self.process_reward_module._handle.reshard(True)
+
+        output = output.to('cpu')
+        torch.cuda.empty_cache()
+        return output
