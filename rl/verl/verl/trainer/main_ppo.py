@@ -199,8 +199,15 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
+            # Check if using Process Reward Model (PRM) for PURE
+            rm_type = config.reward_model.get('type', 'outcome')
+            
             if config.reward_model.strategy == 'fsdp':
-                from verl.workers.fsdp_workers import RewardModelWorker
+                if rm_type == 'prm':
+                    from verl.workers.fsdp_workers import ProcessRewardModelWorker
+                    RewardModelWorker = ProcessRewardModelWorker
+                else:
+                    from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == 'megatron':
                 from verl.workers.megatron_workers import RewardModelWorker
             else:
