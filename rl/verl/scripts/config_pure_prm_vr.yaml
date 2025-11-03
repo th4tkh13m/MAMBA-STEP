@@ -1,0 +1,116 @@
+# PURE-PRM+VR Configuration for MAMBA-STEP
+# Hybrid: Process Reward Model + Verifiable Rewards (SOTA)
+# Combines both PRM and VR with configurable coefficients
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_files: /course/2025/fall/ds/677/amr239/kt477/M1/datasets/M1/train.parquet
+  val_files: /course/2025/fall/ds/677/amr239/kt477/M1/datasets/M1/aime.parquet
+  max_prompt_length: 1024
+  max_response_length: 4096
+  train_batch_size: 4
+  val_batch_size: 1
+  shuffle: True
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    path: JunxiongWang/M1-3B-SFT
+    mamba: True
+    use_remove_padding: True
+    enable_gradient_checkpointing: True
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_mini_batch_size: 4
+    use_dynamic_bsz: True
+    ppo_max_token_len_per_gpu: 5120
+    use_kl_loss: True
+    kl_loss_coef: 0
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.01
+    ulysses_sequence_parallel_size: 1
+    grad_clip: 1
+    fsdp_config:
+      param_offload: False
+      optimizer_offload: True
+      model_dtype: bfloat16
+  rollout:
+    name: hf
+    tensor_model_parallel_size: 1
+    temperature: 0.9
+    val_kwargs:
+      temperature: 0.5
+      n: 4
+    gpu_memory_utilization: 0.5
+    n: 6
+    dtype: bfloat16
+
+# PURE-PRM+VR: Enable both Process Reward Model and Verifiable Rewards
+reward_model:
+  enable: True
+  type: prm  # Process Reward Model
+  strategy: fsdp
+  model:
+    path: <PATH_TO_YOUR_PRM_MODEL>  # Set your PRM model path here
+    use_remove_padding: True
+    enable_gradient_checkpointing: True
+    fsdp_config:
+      param_offload: False
+      wrap_policy:
+        min_num_params: 0
+  reward_manager: prime  # Use PRIME for verifiable rewards (or 'naive' for basic VR)
+  micro_batch_size_per_gpu: null
+  use_dynamic_bsz: True
+  forward_max_token_len_per_gpu: 5120
+  ulysses_sequence_parallel_size: 1
+  # PURE credit assignment configuration
+  credit_assignment: 0.1  # Temperature for approximate min-form
+  # Alternative options:
+  #   - Float (e.g., 0.1): Temperature for approximate min-form (softmax weighting in PRM worker)
+  #   - 'strict min-form': Exact minimum via backward pass (in compute_return)
+  #   - 'gamma-decay': Standard discounted return (uses 'sum' method)
+  
+  # Reward combination: token_level_scores = vr_coef * VR + rm_coef * PRM
+  verifiable_reward_coef: 1.0  # Weight for verifiable rewards (VR)
+  modeling_reward_coef: 0.5    # Weight for process rewards (PRM)
+  
+  # Step splitting configuration for PRM
+  split_step_char: '\n\n'  # Character sequence that separates reasoning steps
+  step_separator: '\n'      # Character added after each step for PRM prediction
+
+custom_reward_function:
+  # Define your custom reward function for verifiable rewards here
+  # This computes the VR component (e.g., correctness check)
+  path: null  # Set to your custom reward function module
+  name: compute_score  # Function name in the module
+
+algorithm:
+  adv_estimator: grpo
+  gamma: 1.0
+  lam: 1.0
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0
+
+trainer:
+  critic_warmup: 0
+  logger: ['console', 'wandb']
+  project_name: 'M1'
+  experiment_name: mamba_pure_prm_vr_vr1.0_prm0.5_temp0.1
+  val_generations_to_log_to_wandb: 1
+  val_before_train: False
+  n_gpus_per_node: 1
+  nnodes: 1
+  save_freq: 3
+  test_freq: 3
+  default_hdfs_dir: null
+  default_local_dir: ./checkpoints/mamba_pure_prm_vr
+  total_epochs: 3
