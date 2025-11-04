@@ -1207,6 +1207,7 @@ class ProcessRewardModelWorker(Worker):
 
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()
+        self.world_size = world_size  # Store for later use
         from torch.distributed.device_mesh import init_device_mesh
 
         fsdp_size = self.config.model.fsdp_config.fsdp_size
@@ -1555,8 +1556,9 @@ class ProcessRewardModelWorker(Worker):
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        self.process_reward_module._handle.reshard(True)
+        # unshard the root FSDP module (only for sharded strategies)
+        if self.world_size > 1:
+            self.process_reward_module._handle.reshard(True)
 
         output = output.to('cpu')
         torch.cuda.empty_cache()
