@@ -582,10 +582,14 @@ class RayPPOTrainer(object):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch)
+            rewards = self.val_reward_fn(test_batch)
+            test_batch = test_batch.union(rewards)
+            
+            # Extract verifiable rewards for validation scoring
+            reward_tensor = test_batch.batch['verifiable_rewards']
 
             # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
+            scores = reward_tensor.cpu().tolist()
             sample_scores.extend(scores)
 
             reward_tensor_lst.append(reward_tensor)
@@ -593,7 +597,8 @@ class RayPPOTrainer(object):
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        # Concatenate all validation rewards (already outcome-level, not token-level)
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         # evaluate test_score based on data source
