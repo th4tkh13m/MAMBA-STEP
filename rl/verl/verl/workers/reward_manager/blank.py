@@ -19,50 +19,36 @@ class BlankRewardManager:
         self.num_examine = num_examine
 
     def __call__(self, data: DataProto):
-        already_print_data_sources = {}
-
-        # batched scoring
-        prompt_ids = data.batch['prompts']
-        prompt_str = self.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
-
-        response_ids = data.batch['responses']
-        sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        ground_truth = [data_item.non_tensor_batch['answer'] for data_item in data]
-        default_data_sources = ['numina_aops_forum'] * len(sequences_str)  # tricky: force to use prime_math.compute_score
-        data_sources = data.batch.get('data_sources', default_data_sources)
-
-        rm_scores = data.batch.get('rm_scores', None)
-        if rm_scores is not None:
-            # orm score > 0 and vr = 1
-            # or orm score <= 0 and vr = 0
-            # then orm_match_vr is True
-            outcome_reward = rm_scores.sum(-1)
-
-        example_idx = 1
-        for i in range(len(data)):
-            output_str = f"{'Rollout Example ' + str(example_idx):#^{50}}\n"
-            data_source = data_sources[i]
-
-            if data_source not in already_print_data_sources:
-                already_print_data_sources[data_source] = 0
-
-            if already_print_data_sources[data_source] < self.num_examine:
-                already_print_data_sources[data_source] += 1
-                
-                output_str += f"Question:\n{repr(prompt_str[i])}\n"  # Unescaped prompts to check chat_template
+        # For PURE-PRM, we only use process rewards (no verifiable rewards)
+        # Print a few examples for debugging if needed
+        if self.num_examine > 0:
+            prompt_ids = data.batch['prompts']
+            prompt_str = self.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+            
+            response_ids = data.batch['responses']
+            sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+            
+            rm_scores = data.batch.get('rm_scores', None)
+            
+            for i in range(min(self.num_examine, len(data))):
+                output_str = f"{'Rollout Example ' + str(i+1):#^{50}}\n"
+                output_str += f"Question:\n{repr(prompt_str[i])}\n"
                 steps = sequences_str[i].split('\n\n')
-                output_str += f"Rollout:\n{steps}\n"
+                output_str += f"Rollout:\n{repr(sequences_str[i])}\n"
                 output_str += f"Num of steps: {len(steps)}\n"
-                output_str += f"Ground-truth: {ground_truth[i]}\n"
                 if rm_scores is not None:
-                    output_str += f"Outcome reward: {outcome_reward[i].item()}\n"
+                    outcome_reward = rm_scores[i].sum()
+                    output_str += f"Outcome reward: {outcome_reward.item()}\n"
                 print(output_str.rstrip())
-                example_idx += 1
+            
+            # Only print once per batch
+            self.num_examine = 0
         
+        # Return zero verifiable rewards for all responses
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         output = DataProto.from_dict({
             "verifiable_rewards": reward_tensor.sum(-1),
             "reward_fn_scores": reward_tensor,
-            })
+        })
 
         return output
