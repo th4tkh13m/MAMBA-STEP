@@ -1541,9 +1541,12 @@ class ProcessRewardModelWorker(Worker):
                 micro_batches = batch.split(self.config.micro_batch_size_per_gpu)
 
             output = []
-            for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
-                output.append(rm_score)
+            # Use no_grad to prevent memory accumulation from gradient tracking
+            with torch.no_grad():
+                for micro_batch in micro_batches:
+                    rm_score = self._forward_micro_batch(micro_batch)
+                    # Detach to ensure no gradient tracking
+                    output.append(rm_score.detach())
             token_level_scores = torch.cat(output, dim=0)
 
             if use_dynamic_bsz:
@@ -1552,7 +1555,8 @@ class ProcessRewardModelWorker(Worker):
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 token_level_scores = token_level_scores[revert_indices]
 
-            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            # Detach final scores to break any remaining computational graph
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores.detach()})
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
