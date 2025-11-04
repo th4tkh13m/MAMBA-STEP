@@ -896,16 +896,18 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
+                        rewards = self.reward_fn(batch)
+                        batch = batch.union(rewards)
                         
                         # PURE: Combine VR and PRM scores if both are available
+                        token_level_vr = batch.batch['reward_fn_scores']
                         if 'rm_scores' in batch.batch.keys():
                             vr_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
                             rm_coef = self.config.reward_model.get('modeling_reward_coef', 1.0)
                             rm_scores = batch.batch['rm_scores']
-                            batch.batch['token_level_scores'] = vr_coef * reward_tensor + rm_coef * rm_scores
+                            batch.batch['token_level_scores'] = vr_coef * token_level_vr + rm_coef * rm_scores
                         else:
-                            batch.batch['token_level_scores'] = reward_tensor
+                            batch.batch['token_level_scores'] = token_level_vr
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
