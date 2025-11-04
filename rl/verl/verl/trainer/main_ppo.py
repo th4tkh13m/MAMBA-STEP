@@ -125,15 +125,16 @@ def main(config):
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    
+    # Set environment variables directly instead of using runtime_env
+    # This avoids Runtime Env Agent dependency issues
+    os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+    os.environ['NCCL_DEBUG'] = 'WARN'
+    os.environ['VLLM_LOGGING_LEVEL'] = 'WARN'
+    
     if not ray.is_initialized():
-        # this is for local ray cluster
-        ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
-            }
-        })
+        # Initialize Ray without runtime_env to avoid Runtime Env Agent timeout
+        ray.init()
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
