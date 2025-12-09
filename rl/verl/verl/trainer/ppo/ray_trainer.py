@@ -165,7 +165,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, return_aggregate_method='sum'):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
@@ -191,7 +191,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        return_aggregate_method=return_aggregate_method)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS:
@@ -201,7 +202,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         attention_mask = data.batch['attention_mask']
         response_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_reinforce_plus_plus_outcome_advantage(
-            token_level_rewards=token_level_rewards, eos_mask=response_mask, gamma=gamma)
+            token_level_rewards=token_level_rewards, eos_mask=response_mask, gamma=gamma, 
+            return_aggregate_method=return_aggregate_method)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.REMAX:
@@ -229,7 +231,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        return_aggregate_method=return_aggregate_method)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -305,6 +308,24 @@ class RayPPOTrainer(object):
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        # PURE: Credit assignment configuration
+        if self.use_rm:
+            credit_assignment = self.config.reward_model.get('credit_assignment', 'sum')
+            if isinstance(credit_assignment, str):
+                if credit_assignment == 'strict min-form':
+                    self.return_aggregate_method = 'min'
+                elif credit_assignment == 'gamma-decay':
+                    self.return_aggregate_method = 'sum'
+                else:
+                    # Default to sum if unrecognized string
+                    self.return_aggregate_method = 'sum'
+            else:
+                # If it's a float (temperature for approximate min-form), use sum in advantage computation
+                # The approximate min-form is handled in ProcessRewardModelWorker
+                self.return_aggregate_method = 'sum'
+        else:
+            self.return_aggregate_method = 'sum'
 
         self._validate_config()
         self._create_dataloader()
@@ -561,10 +582,14 @@ class RayPPOTrainer(object):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch)
+            rewards = self.val_reward_fn(test_batch)
+            test_batch = test_batch.union(rewards)
+            
+            # Extract verifiable rewards for validation scoring
+            reward_tensor = test_batch.batch['verifiable_rewards']
 
             # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
+            scores = reward_tensor.cpu().tolist()
             sample_scores.extend(scores)
 
             reward_tensor_lst.append(reward_tensor)
@@ -572,7 +597,8 @@ class RayPPOTrainer(object):
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        # Concatenate all validation rewards (already outcome-level, not token-level)
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         # evaluate test_score based on data source
@@ -875,8 +901,18 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        rewards = self.reward_fn(batch)
+                        batch = batch.union(rewards)
+                        
+                        # PURE: Combine VR and PRM scores if both are available
+                        token_level_vr = batch.batch['reward_fn_scores']
+                        if 'rm_scores' in batch.batch.keys():
+                            vr_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
+                            rm_coef = self.config.reward_model.get('modeling_reward_coef', 1.0)
+                            rm_scores = batch.batch['rm_scores']
+                            batch.batch['token_level_scores'] = vr_coef * token_level_vr + rm_coef * rm_scores
+                        else:
+                            batch.batch['token_level_scores'] = token_level_vr
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
@@ -892,7 +928,8 @@ class RayPPOTrainer(object):
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                                                  num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                                  return_aggregate_method=self.return_aggregate_method)
 
                     # update critic
                     if self.use_critic:

@@ -1,0 +1,6 @@
+model_path,dataset,pass@1,pass@16
+/scratch/phan/kt477/MAMBA-STEP/mamba_pure_prm/global_step_110/test/huggingface,aime2025.parquet,0.0,0.0
+/scratch/phan/kt477/MAMBA-STEP/mamba_pure_prm/global_step_110/test/huggingface,aime.parquet,0.0,0.0
+/scratch/phan/kt477/MAMBA-STEP/mamba_pure_prm/global_step_110/test/huggingface,amc.parquet,0.0,0.0
+/scratch/phan/kt477/MAMBA-STEP/mamba_pure_prm/global_step_110/test/huggingface,math.parquet,0.0,0.0
+/scratch/phan/kt477/MAMBA-STEP/mamba_pure_prm/global_step_110/test/huggingface,olympiad_bench.parquet,0.0,0.0

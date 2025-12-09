@@ -66,6 +66,47 @@ def get_kl_controller(config):
 
     return kl_ctrl
 
+# Khiem: PURE return
+@torch.no_grad()
+def compute_return(token_level_rewards, eos_mask, method='sum', gamma=1.0):
+    """Compute returns from token-level rewards using different aggregation methods.
+    
+    This function supports multiple credit assignment strategies:
+    - 'sum': Traditional discounted cumulative rewards (gamma-decay)
+    - 'min': Min-form credit assignment - identifies the bottleneck step
+    
+    Args:
+        token_level_rewards: (torch.Tensor) shape: (bs, response_length)
+            Token-level rewards for each position
+        eos_mask: (torch.Tensor) shape: (bs, response_length)  
+            Mask indicating valid positions (1) vs padding (0)
+        method: (str) Aggregation method - 'sum' or 'min'
+        gamma: (float) Discount factor for 'sum' method
+        
+    Returns:
+        returns: (torch.Tensor) shape: (bs, response_length)
+            Computed returns for each position
+    """
+    response_length = token_level_rewards.shape[-1]
+
+    if method == 'sum':
+        # Traditional discounted cumulative rewards
+        returns = token_level_rewards * eos_mask
+        for col in range(response_length-2, -1, -1):
+            returns[:, col] = returns[:, col] + gamma * returns[:, col+1]
+        returns *= eos_mask
+    elif method == 'min':
+        # Min-form credit assignment: each step's value = min of all future rewards
+        # This identifies the bottleneck step in reasoning chains
+        returns = token_level_rewards.masked_fill(~eos_mask.bool(), torch.inf)
+        for col in range(response_length-2, -1, -1):
+            returns[:, col] = torch.min(returns[:, col], returns[:, col+1])
+        returns = returns.masked_fill(~eos_mask.bool(), 0)
+    else:
+        raise NotImplementedError(f"Unknown return aggregation method: {method}")
+    
+    return returns
+
 
 def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torch.Tensor, eos_mask: torch.Tensor,
                                  gamma: torch.Tensor, lam: torch.Tensor):
@@ -111,7 +152,9 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
 def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
-                                   epsilon: float = 1e-6):
+                                   epsilon: float = 1e-6,
+                                   adv_norm: bool = False,
+                                   return_aggregate_method: str = 'sum'):
     """
     Compute advantage for GRPO, operating only on Outcome reward 
     (with only one scalar reward for each response).
@@ -120,6 +163,8 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
             shape: (bs, response_length)
         eos_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        return_aggregate_method: `(str)`
+            'sum' for traditional gamma-decay, 'min' for min-form credit assignment
     
     Returns:
         advantages: `(torch.Tensor)`
@@ -127,37 +172,37 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
-    response_length = token_level_rewards.shape[-1]
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
+    returns = compute_return(token_level_rewards, eos_mask, return_aggregate_method)
+    advantages = torch.zeros_like(returns)
+    
+    id2return = defaultdict(list)
     id2mean = {}
     id2std = {}
 
     with torch.no_grad():
-        bsz = scores.shape[0]
+        bsz = returns.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            id2return[index[i]].append(returns[i])
+        for idx in id2return:
+            if len(id2return[idx]) > 0:
+                id2mean[idx] = torch.mean(torch.stack(id2return[idx]))
+                id2std[idx] = torch.std(torch.stack(id2return[idx]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
-
-    return scores, scores
+            advantages[i] = (returns[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+        
+        if adv_norm:
+            advantages = verl_F.masked_whiten(advantages, eos_mask)
+            advantages *= eos_mask
+    return advantages, returns
 
 
 def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
-                                   epsilon: float = 1e-6):
+                                   adv_norm: bool = False,
+                                   return_aggregate_method: str = 'sum'):
     """
     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
     Args:
@@ -165,6 +210,8 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
             shape: (bs, response_length)
         eos_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        return_aggregate_method: `(str)`
+            'sum' for traditional gamma-decay, 'min' for min-form credit assignment
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -173,34 +220,36 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
             shape: (bs, response_length)
     """
     response_length = token_level_rewards.shape[-1]
-    scores = token_level_rewards.sum(dim=-1)
+    returns = compute_return(token_level_rewards, eos_mask, return_aggregate_method)
+    advantages = torch.zeros_like(returns)
 
-    id2score = defaultdict(list)
-    id2mean = {}
+    id2return = defaultdict(list)
+    id2sum = {}
 
     with torch.no_grad():
-        bsz = scores.shape[0]
+        bsz = returns.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+            id2return[index[i]].append(returns[i].sum())
+        for idx in id2return:
+            if len(id2return[idx]) > 0:
+                id2sum[idx] = torch.sum(torch.tensor(id2return[idx]))
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            response_num = len(id2score[index[i]])
-            if response_num > 1:
-                scores[i] = scores[i] * response_num / (response_num -
-                                                        1) - id2mean[index[i]] * response_num / (response_num - 1)
-        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
-
-    return scores, scores
+            response_num = len(id2return[index[i]])
+            token_level_baseline = (id2sum[index[i]] - returns[i].sum()) / ((response_num - 1) * response_length)
+            advantages[i] = returns[i] - token_level_baseline
+        
+        if adv_norm:
+            advantages = verl_F.masked_whiten(advantages, eos_mask)
+            advantages *= eos_mask
+    return advantages, returns
 
 
 def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Tensor, eos_mask: torch.Tensor,
-                                                  gamma: torch.Tensor):
+                                                  gamma: torch.Tensor,
+                                                  adv_norm: bool = True,
+                                                  return_aggregate_method: str = 'sum'):
     """
     Compute advantage for REINFORCE++. 
     This implementation is based on the paper: https://arxiv.org/abs/2501.03262
@@ -209,6 +258,8 @@ def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Ten
             shape: (bs, response_length)
         eos_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        return_aggregate_method: `(str)`
+            'sum' for traditional gamma-decay, 'min' for min-form credit assignment
     
     Returns:
         advantages: `(torch.Tensor)`
@@ -216,19 +267,12 @@ def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Ten
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
-
-    with torch.no_grad():
-        returns = torch.zeros_like(token_level_rewards)
-        running_return = 0
-
-        for t in reversed(range(token_level_rewards.shape[1])):
-            running_return = token_level_rewards[:, t] + gamma * running_return
-            returns[:, t] = running_return
-            # Reset after EOS
-            running_return = running_return * eos_mask[:, t]
-
+    returns = compute_return(token_level_rewards, eos_mask, return_aggregate_method, gamma)
+    if adv_norm:
         advantages = verl_F.masked_whiten(returns, eos_mask)
         advantages = advantages * eos_mask
+    else:
+        advantages = returns
 
     return advantages, returns
 

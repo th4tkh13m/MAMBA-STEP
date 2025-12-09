@@ -108,11 +108,21 @@ class MambaTransformerHybridModelWrapper(nn.Module, GenerationMixin):
                 else:
                     # support save from safetensors
                     ckpt = load_safetensors_to_dict(checkpoint_path)
+            new_ckpt = {}
+            for k, v in ckpt.items():
+                # remove extra 'model.' prefix
+                if k.startswith("model.model."):
+                    new_key = k[len("model."):]  # remove first 'model.'
+                elif k == "model.lm_head.weight":
+                    new_key = "lm_head.weight"
+                else:
+                    new_key = k
+                new_ckpt[new_key] = v
 
             if self.config.tie_word_embeddings:
-                ckpt["lm_head.weight"] = ckpt["model.embed_tokens.weight"]
+                new_ckpt["lm_head.weight"] = new_ckpt["model.embed_tokens.weight"]
 
-            self.model.load_state_dict(ckpt)
+            self.model.load_state_dict(new_ckpt)
 
         self.device = self.model.device
         self.dtype = dtype

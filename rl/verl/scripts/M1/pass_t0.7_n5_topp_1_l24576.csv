@@ -1,0 +1,4 @@
+model_path,dataset,pass@1,pass@5
+/scratch/phan/kt477/MAMBA-STEP/grpo_cg_packfix_4_8192_1_3e-6_0.01_0_0.9_2_new_veRL/global_step_290/actor/huggingface,aime2025.parquet,0.17333333333333334,0.26666666666666666
+/scratch/phan/kt477/MAMBA-STEP/grpo_cg_packfix_4_8192_1_3e-6_0.01_0_0.9_2_new_veRL/global_step_290/actor/huggingface,aime.parquet,0.08,0.23333333333333334
+/scratch/phan/kt477/MAMBA-STEP/grpo_cg_packfix_4_8192_1_3e-6_0.01_0_0.9_2_new_veRL/global_step_290/actor/huggingface,amc.parquet,0.42891566265060244,0.5421686746987951

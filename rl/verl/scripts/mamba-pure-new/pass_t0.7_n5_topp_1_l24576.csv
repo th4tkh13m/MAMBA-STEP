@@ -1,0 +1,4 @@
+model_path,dataset,pass@1,pass@5
+/scratch/phan/kt477/MAMBA-STEP/checkpoints/mamba_pure_prm-new/global_step_105/actor/huggingface,aime2025.parquet,0.19333333333333333,0.26666666666666666
+/scratch/phan/kt477/MAMBA-STEP/checkpoints/mamba_pure_prm-new/global_step_105/actor/huggingface,aime.parquet,0.18666666666666668,0.43333333333333335
+/scratch/phan/kt477/MAMBA-STEP/checkpoints/mamba_pure_prm-new/global_step_105/actor/huggingface,amc.parquet,0.46987951807228917,0.6746987951807228

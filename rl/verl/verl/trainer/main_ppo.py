@@ -125,15 +125,16 @@ def main(config):
     # TODO(linjunrong.ocss884): this ENV is left for resolving SGLang conflict with ray devices
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    
+    # Set environment variables directly instead of using runtime_env
+    # This avoids Runtime Env Agent dependency issues
+    os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+    os.environ['NCCL_DEBUG'] = 'WARN'
+    os.environ['VLLM_LOGGING_LEVEL'] = 'WARN'
+    
     if not ray.is_initialized():
-        # this is for local ray cluster
-        ray.init(runtime_env={
-            'env_vars': {
-                'TOKENIZERS_PARALLELISM': 'true',
-                'NCCL_DEBUG': 'WARN',
-                'VLLM_LOGGING_LEVEL': 'WARN'
-            }
-        })
+        # Initialize Ray without runtime_env to avoid Runtime Env Agent timeout
+        ray.init()
 
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
@@ -199,8 +200,15 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
+            # Check if using Process Reward Model (PRM) for PURE
+            rm_type = config.reward_model.get('type', 'outcome')
+            
             if config.reward_model.strategy == 'fsdp':
-                from verl.workers.fsdp_workers import RewardModelWorker
+                if rm_type == 'prm':
+                    from verl.workers.fsdp_workers import ProcessRewardModelWorker
+                    RewardModelWorker = ProcessRewardModelWorker
+                else:
+                    from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == 'megatron':
                 from verl.workers.megatron_workers import RewardModelWorker
             else:
@@ -208,25 +216,25 @@ class TaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        # reward_manager_name = config.reward_model.get("reward_manager", "naive")
-        # if reward_manager_name == 'naive':
-        #     from verl.workers.reward_manager import NaiveRewardManager
-        #     reward_manager_cls = NaiveRewardManager
-        # elif reward_manager_name == 'prime':
-        #     from verl.workers.reward_manager import PrimeRewardManager
-        #     reward_manager_cls = PrimeRewardManager
-        # else:
-        #     raise NotImplementedError
+        # Khiem: Handle different reward manager types
+        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+        if reward_manager_name == 'naive':
+            from verl.workers.reward_manager import NaiveRewardManager
+            reward_manager_cls = NaiveRewardManager
+        elif reward_manager_name == 'prime':
+            from verl.workers.reward_manager import PrimeRewardManager
+            reward_manager_cls = PrimeRewardManager
+        elif reward_manager_name == 'blank':
+            from verl.workers.reward_manager import BlankRewardManager
+            reward_manager_cls = BlankRewardManager
+        else:
+            raise NotImplementedError
 
-        # compute_score = get_custom_reward_fn(config)
-        # reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
+        compute_score = get_custom_reward_fn(config)
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
 
-        # # Note that we always use function-based RM for validation
-        # val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
-
-        reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
-
-        val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+        # Note that we always use function-based RM for validation
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
