@@ -115,4 +115,9 @@ class NaiveRewardManager:
                 print("[ground_truth]", ground_truth)
                 print("[score]", score)
 
-        return reward_tensor
+        output = DataProto.from_dict({
+            "verifiable_rewards": reward_tensor.sum(-1),
+            "reward_fn_scores": reward_tensor,
+        })
+
+        return output

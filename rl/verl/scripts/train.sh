@@ -10,17 +10,17 @@ MODEL_PATH="JunxiongWang/M1-3B-SFT"
 
 echo $MODEL_PATH
 
-BSZ=4
+BSZ=128
 LEN=10240
 CLIP=1
 LR="1e-6"
-N=6
+N=8
 EN_COEFF=0.01
 KL_COEFF=0
 TMP=0.9
-PPO_BSZ=4
+PPO_BSZ=32
 
-mkdir ./grpo_cg_${BSZ}_${LEN}_${CLIP}_${LR}_${EN_COEFF}_${KL_COEFF}_${TMP}_${PPO_BSZ}
+mkdir ./MAMBA-STEP-test
 
 # Train over a single node, 8 A100-80GB GPUs.
 python3 -m verl.trainer.main_ppo \
@@ -51,7 +51,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=hf \
     actor_rollout_ref.rollout.temperature=${TMP} \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.5 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=${N} \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
@@ -61,15 +61,16 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name='M1' \
     trainer.val_generations_to_log_to_wandb=1 \
-    trainer.experiment_name=grpo_cg_packfix_${BSZ}_${LEN}_${CLIP}_${LR}_${EN_COEFF}_${KL_COEFF}_${TMP}_${PPO_BSZ}_new_veRL\
+    trainer.experiment_name=MAMBA-STEP-test \
     +trainer.val_before_train=False \
-    trainer.n_gpus_per_node=1 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=3 \
     trainer.test_freq=3 \
     trainer.default_hdfs_dir=null \
-    trainer.default_local_dir=grpo_cg_packfix_${BSZ}_${LEN}_${CLIP}_${LR}_${EN_COEFF}_${KL_COEFF}_${TMP}_${PPO_BSZ}_new_veRL \
-    trainer.total_epochs=3
+    trainer.default_local_dir=MAMBA-STEP-test \
+    trainer.total_epochs=3 \
+    +ray_kwargs.ray_init.num_cpus=16
 
 
 # bash scripts/train.sh /data/junxiong/Mamba-Llama-3.2-3B-R1_SFT-24576-ep5-colm-ot1m-ep5 128 32768 1 1e-6 8 0.01 0 0.9 64

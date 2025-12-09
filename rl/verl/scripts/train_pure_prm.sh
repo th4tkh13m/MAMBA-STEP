@@ -6,9 +6,9 @@ set -x
 
 # Warning: Export VLLM_ATTENTION_BACKEND on every machine before starting Ray cluster.
 export VLLM_ATTENTION_BACKEND=XFORMERS
-
+BASEDIR="/project/phan/kt477/MAMBA-STEP/M1/rl/verl/scripts"
 # Set your PRM model path here
-PRM_MODEL_PATH="<PATH_TO_YOUR_PRM_MODEL>"
+PRM_MODEL_PATH="jinachris/PURE-PRM-7B"
 
 # Temperature for approximate min-form credit assignment
 # Lower values (~0.1) -> sharper weighting on worst step
@@ -26,10 +26,7 @@ mkdir -p ./checkpoints/${EXP_NAME}
 
 # Train with PURE-PRM configuration
 python3 -m verl.trainer.main_ppo \
-    --config-name config_pure_prm \
-    reward_model.model.path=$PRM_MODEL_PATH \
-    reward_model.credit_assignment=$CREDIT_TEMP \
-    trainer.experiment_name=$EXP_NAME \
-    trainer.default_local_dir=./checkpoints/${EXP_NAME}
+    --config-path=${BASEDIR} \
+    --config-name config_pure_prm 
 
 echo "Training completed. Checkpoints saved to: ./checkpoints/${EXP_NAME}"

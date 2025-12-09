@@ -71,7 +71,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+    # PURE: Get instant reward components for debugging
+    default_rewards = torch.zeros_like(sequence_reward)
+    verifiable_rewards = batch.batch.get('verifiable_rewards', default_rewards)
+    outcome_rewards = batch.batch.get('rm_scores', None)
+    if outcome_rewards is None:
+        outcome_rewards = default_rewards
+    else:
+        outcome_rewards = outcome_rewards.sum(-1)
+
     metrics = {
+        # PURE: instant rewards breakdown
+        'instant_rewards/verifiable_reward/mean':
+            torch.mean(verifiable_rewards).detach().item(),
+        'instant_rewards/verifiable_reward/max':
+            torch.max(verifiable_rewards).detach().item(),
+        'instant_rewards/verifiable_reward/min':
+            torch.min(verifiable_rewards).detach().item(),
+        'instant_rewards/outcome_reward/mean':
+            torch.mean(outcome_rewards).detach().item(),
+        'instant_rewards/outcome_reward/max':
+            torch.max(outcome_rewards).detach().item(),
+        'instant_rewards/outcome_reward/min':
+            torch.min(outcome_rewards).detach().item(),
         # score
         'critic/score/mean':
             torch.mean(sequence_score).detach().item(),
